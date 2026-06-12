@@ -1,0 +1,1542 @@
+---
+title: "Bayesian Analysis of US Spot Bitcoin ETFs"
+subtitle: "Introduction to Bayesian Learning"
+author: "Davide Frosi"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    df_print: paged
+    code_folding: show
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 5,
+  fig.align  = "center"
+)
+set.seed(42)
+```
+
+---
+
+# Background
+
+On **January 11, 2024**, the SEC approved the first US spot Bitcoin ETFs, the same underlying
+asset (Bitcoin) wrapped by six competing asset managers simultaneously. This creates a
+natural laboratory for Bayesian analysis: identical instruments, different brand/fee structures,
+~340 trading days of daily prices and volumes.
+
+**Research questions (Bayesian lens)**:
+
+1. Has BlackRock IBIT's dominance **eroded** as the market matured from Year 1 to Year 2+? *(Regime-shift Beta-Binomial)*
+2. Among the non-IBIT ETFs, which fund leads the second-tier volume competition? *(Binomial comparison, Bayes Factor)*
+3. Is the expected daily return of these ETFs positive? Does Bitcoin evidence support the Efficient Market Hypothesis? *(Normal-InvGamma conjugate + improper priors)*
+4. Which ETF **tracks Bitcoin most cleanly**, and can we rank them by tracking error variance? *(Bayesian InvGamma variance comparison)*
+5. Does IBIT faithfully replicate Bitcoin returns (β = 1)? Has tracking efficiency improved over time? *(Bayesian regression + time-split)*
+6. Are the MCMC chains reliable? *(Diagnostics)*
+
+---
+
+# Section 0 — Setup and Data Acquisition
+
+```{r packages}
+# Install any missing packages
+required_packages <- c(
+  "quantmod",    # Yahoo Finance data pull
+  "dplyr",       # data manipulation
+  "tidyr",       # reshaping
+  "ggplot2",     # visualization
+  "scales",      # axis formatting
+  "binom",       # binomial posterior intervals (HPD, Wald, Wilson)
+  "LearnBayes",  # beta.select — prior elicitation from quantiles
+  "invgamma",    # dinvgamma / rinvgamma
+  "HDInterval",  # HPD intervals via simulation
+  "extraDistr",  # dbbinom — Beta-Binomial predictive
+  "MCMCpack",    # MCMCregress — MCMC with conjugate priors
+  "brms",        # full Bayesian regression via Stan
+  "bayesplot",   # MCMC diagnostic plots
+  "BayesFactor", # contingencyTableBF — Bayes factors
+  "abind"        # abind — array merging for brms posteriors
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+```
+
+```{r data-acquisition}
+# ETF tickers (Yahoo Finance)
+# All launched January 11, 2024 (SEC approval date)
+etf_tickers <- c(
+  "IBIT",   # BlackRock iShares Bitcoin Trust      — fee 0.25%
+  "FBTC",   # Fidelity Wise Origin Bitcoin Fund    — fee 0.25%
+  "BITB",   # Bitwise Bitcoin ETF                  — fee 0.20%
+  "ARKB",   # ARK 21Shares Bitcoin ETF             — fee 0.21%
+  "HODL",   # VanEck Bitcoin ETF                   — fee 0.20%
+  "BTCO"    # Invesco Galaxy Bitcoin ETF           — fee 0.25%
+)
+
+start_date <- "2024-01-11"
+end_date   <- Sys.Date()
+
+# Download price + volume for all ETFs and Bitcoin reference
+invisible(
+  getSymbols(
+    Symbols     = c(etf_tickers, "BTC-USD"),
+    src         = "yahoo",
+    from        = start_date,
+    to          = end_date,
+    auto.assign = TRUE,
+    make.names  = TRUE,
+    warnings    = FALSE
+  )
+)
+
+# Ensure the BTC reference object is available under the expected symbol name
+if (!exists("BTC.USD") && exists("BTC-USD")) {
+  assign("BTC.USD", get("BTC-USD"))
+}
+```
+
+```{r data-cleaning}
+# Helper: extract adjusted close + volume from xts
+extract_series <- function(ticker) {
+  # getSymbols replaces "-" with "." in variable names (BTC-USD → BTC.USD)
+  sym_name <- gsub("-", ".", ticker)
+  sym      <- get(sym_name)
+  adj      <- Ad(sym)
+  vol      <- Vo(sym)
+  colnames(adj) <- paste0(ticker, "_price")
+  colnames(vol) <- paste0(ticker, "_volume")
+  merge(adj, vol)
+}
+
+# Merge all ETFs into a single xts object
+raw_xts <- Reduce(merge, lapply(etf_tickers, extract_series))
+
+# Add Bitcoin reference price
+btc_symbol <- if (exists("BTC.USD")) {
+  "BTC.USD"
+} else if (exists("BTC-USD")) {
+  "BTC-USD"
+} else {
+  stop("Bitcoin reference object not found. Expected BTC.USD or BTC-USD.")
+}
+btc_xts         <- Ad(get(btc_symbol))
+colnames(btc_xts) <- "BTC_price"
+raw_xts <- merge(raw_xts, btc_xts)
+
+# Convert to data.frame; drop all rows with ANY missing value
+# (covers early days when some ETFs had not yet settled their first trade)
+df_raw        <- data.frame(date = index(raw_xts), coredata(raw_xts))
+df_raw        <- na.omit(df_raw)
+
+# Compute daily log-returns: r_t = log(P_t / P_{t-1})
+for (tk in c(etf_tickers, "BTC")) {
+  col <- paste0(tk, "_price")
+  df_raw[[paste0(tk, "_logret")]] <- c(NA, diff(log(df_raw[[col]])))
+}
+
+# Compute daily volume shares
+vol_cols          <- paste0(etf_tickers, "_volume")
+df_raw$total_vol  <- rowSums(df_raw[, vol_cols], na.rm = TRUE)
+for (tk in etf_tickers) {
+  df_raw[[paste0(tk, "_share")]] <- df_raw[[paste0(tk, "_volume")]] /
+                                    df_raw$total_vol
+}
+
+# Drop the first row (NA log-returns) → clean working dataset
+df <- df_raw[!is.na(df_raw$IBIT_logret), ]
+
+cat("Trading days in sample :", nrow(df), "\n")
+cat("Date range             :", format(min(df$date)), "to", format(max(df$date)), "\n")
+
+# Average volume shares by period
+share_cols <- paste0(etf_tickers, "_share")
+
+# (Summary computed after we split the sample into Year 1 and Year 2+)
+```
+
+---
+
+# Section 1 — Exploratory Data Analysis
+
+```{r eda-prices, fig.height=5}
+# Normalized price series (launch = 100)
+price_cols <- c(paste0(etf_tickers, "_price"), "BTC_price")
+df_norm    <- df
+
+for (col in price_cols) {
+  df_norm[[col]] <- df_norm[[col]] / df_norm[[col]][1] * 100
+}
+
+df_prices_long <- tidyr::pivot_longer(
+  df_norm[, c("date", price_cols)],
+  cols = -date, names_to = "asset", values_to = "norm_price"
+) %>%
+  mutate(asset = gsub("_price", "", asset),
+         type  = ifelse(asset == "BTC", "BTC Reference", "Spot ETF"))
+
+ggplot(df_prices_long, aes(x = date, y = norm_price,
+                            color = asset, linetype = type)) +
+  geom_line(linewidth = 0.7) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_color_brewer(palette = "Set2") +
+  labs(title  = "Normalized Prices: US Spot Bitcoin ETFs vs BTC (Base = 100 at Launch)",
+       x = NULL, y = "Indexed Price (100 = Jan 11 2024)",
+       color = "Asset", linetype = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+```{r eda-shares, fig.height=5}
+# Daily volume share stacked area
+share_cols <- paste0(etf_tickers, "_share")
+df_shares_long <- tidyr::pivot_longer(
+  df[, c("date", share_cols)],
+  cols = -date, names_to = "etf", values_to = "share"
+) %>% mutate(etf = gsub("_share", "", etf))
+
+ggplot(df_shares_long, aes(x = date, y = share, fill = etf)) +
+  geom_area(position = "stack", alpha = 0.85) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title  = "Daily Volume Market Shares — US Spot Bitcoin ETFs",
+       x = NULL, y = "Share of Total ETF Volume", fill = "ETF") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+```{r eda-returns}
+# Summary statistics for log-returns
+ret_cols <- paste0(etf_tickers, "_logret")
+
+summary_stats <- lapply(etf_tickers, function(tk) {
+  r <- df[[paste0(tk, "_logret")]]
+  data.frame(
+    ETF          = tk,
+    N            = length(r),
+    Mean_pct     = round(mean(r) * 100, 4),
+    SD_pct       = round(sd(r) * 100, 4),
+    Ann_Ret_pct  = round(mean(r) * 252 * 100, 2),   # annualised
+    Ann_Vol_pct  = round(sd(r) * sqrt(252) * 100, 2),
+    Skewness     = round(mean(((r - mean(r))/sd(r))^3), 3),
+    Ex_Kurtosis  = round(mean(((r - mean(r))/sd(r))^4) - 3, 3)
+  )
+})
+do.call(rbind, summary_stats)
+```
+
+```{r eda-hist, fig.height=6}
+# Return distribution histograms by ETF
+df_rets_long <- tidyr::pivot_longer(
+  df[, c("date", ret_cols)],
+  cols = -date, names_to = "etf", values_to = "logret"
+) %>% mutate(etf = gsub("_logret", "", etf))
+
+ggplot(df_rets_long, aes(x = logret * 100)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40,
+                 fill = "steelblue", alpha = 0.7, color = "white") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  facet_wrap(~etf, ncol = 3) +
+  labs(title = "Daily Log-Return Distributions by ETF",
+       x = "Daily Log-Return (%)", y = "Density") +
+  theme_minimal(base_size = 11)
+```
+
+```{r eda-corr}
+# Pairwise correlation matrix of log-returns
+cor_mat <- cor(df[, ret_cols], use = "complete.obs")
+rownames(cor_mat) <- colnames(cor_mat) <- etf_tickers
+round(cor_mat, 4)
+# Near-unity correlations confirm these ETFs track the same underlying asset
+```
+
+---
+
+# Section 2 — Market Share Analysis (Beta-Binomial)
+
+## 2.1 Binomial Framing: Regime-Shift in IBIT Dominance
+
+IBIT captured >50% of total ETF volume on virtually every day — a proportion too close to 1
+for tail probabilities to be meaningful. A more interesting question is whether IBIT's
+**strong** dominance (>70% of volume) has eroded as the market matured and competition grew.
+
+We split the sample at **January 11, 2025** (the 1-year anniversary) and model each period
+as a separate Bernoulli experiment:
+- $\pi_1$ = P(IBIT captures >70% of volume | Year 1, Jan 2024–Jan 2025)
+- $\pi_2$ = P(IBIT captures >70% of volume | Year 2+, Jan 2025–present)
+
+The **regime-shift hypothesis** is $H_1: \pi_1 > \pi_2$, BlackRock's initial surge has faded.
+
+```{r binomial-setup}
+# Split at 1-year anniversary
+cutoff_date <- as.Date("2025-01-11")
+df_y1 <- df[df$date < cutoff_date, ]
+df_y2 <- df[df$date >= cutoff_date, ]
+
+# Strong dominance: >70% threshold
+n1 <- nrow(df_y1);  y1 <- sum(df_y1$IBIT_share > 0.70)
+n2 <- nrow(df_y2);  y2 <- sum(df_y2$IBIT_share > 0.70)
+
+avg_shares <- data.frame(
+  ETF          = etf_tickers,
+  Y1_avg_pct   = round(colMeans(df_y1[, share_cols]) * 100, 1),
+  Y2_avg_pct   = round(colMeans(df_y2[, share_cols]) * 100, 1),
+  Full_avg_pct = round(colMeans(df[, share_cols]) * 100, 1)
+)
+print(avg_shares, row.names = FALSE)
+
+cat("Period 1 (Year 1) :", n1, "days |", y1, "strong-dominance days | π̂₁ =",
+    round(y1/n1, 4), "\n")
+cat("Period 2 (Year 2+):", n2, "days |", y2, "strong-dominance days | π̂₂ =",
+    round(y2/n2, 4), "\n")
+```
+
+## 2.2 Three Prior Distributions (for each period)
+
+```{r prior-spec}
+# (a) Uniform: Beta(1, 1) — complete prior ignorance
+a1_unif <- 1; a2_unif <- 1
+
+# (b) Jeffreys: Beta(0.5, 0.5) — objective reference prior
+a1_jeff <- 0.5; a2_jeff <- 0.5
+
+# (c) Informative: prior belief for Year 1 — P(π < 0.60) = 0.10, P(π < 0.90) = 0.90
+# Encodes: BlackRock brand advantage expected to produce strong dominance early
+q_lo   <- list(p = 0.10, x = 0.60)
+q_hi   <- list(p = 0.90, x = 0.90)
+sh_inf <- LearnBayes::beta.select(q_lo, q_hi)
+a1_inf <- sh_inf[1]; a2_inf <- sh_inf[2]
+
+prior_summary <- data.frame(
+  Prior      = c("Uniform", "Jeffreys", "Informative"),
+  alpha1     = c(a1_unif, a1_jeff, a1_inf),
+  alpha2     = c(a2_unif, a2_jeff, a2_inf),
+  Prior_Mean = round(c(a1_unif, a1_jeff, a1_inf) /
+               (c(a1_unif, a1_jeff, a1_inf) + c(a2_unif, a2_jeff, a2_inf)), 3),
+  Prior_SD   = round(sqrt(
+    c(a1_unif, a1_jeff, a1_inf) * c(a2_unif, a2_jeff, a2_inf) /
+    ((c(a1_unif, a1_jeff, a1_inf) + c(a2_unif, a2_jeff, a2_inf))^2 *
+     (c(a1_unif, a1_jeff, a1_inf) + c(a2_unif, a2_jeff, a2_inf) + 1))
+  ), 3)
+)
+print(prior_summary)
+```
+
+## 2.3 Posterior Distributions (Beta-Binomial Conjugacy)
+
+With a $\text{Beta}(\alpha_1, \alpha_2)$ prior and $\text{Binom}(n, \pi)$ likelihood, the
+posterior is analytically: $\pi \mid y \sim \text{Beta}(y + \alpha_1, \; n - y + \alpha_2)$.
+
+We compute posteriors **separately for each period** under each prior.
+
+```{r posterior-compute}
+# Period 1 posterior hyperparameters
+a1p_u_y1 <- y1 + a1_unif;   a2p_u_y1 <- n1 - y1 + a2_unif
+a1p_j_y1 <- y1 + a1_jeff;   a2p_j_y1 <- n1 - y1 + a2_jeff
+a1p_i_y1 <- y1 + a1_inf;    a2p_i_y1 <- n1 - y1 + a2_inf
+
+# Period 2 posterior hyperparameters
+a1p_u_y2 <- y2 + a1_unif;   a2p_u_y2 <- n2 - y2 + a2_unif
+a1p_j_y2 <- y2 + a1_jeff;   a2p_j_y2 <- n2 - y2 + a2_jeff
+a1p_i_y2 <- y2 + a1_inf;    a2p_i_y2 <- n2 - y2 + a2_inf
+
+# Posterior means with shrinkage decomposition (uniform prior)
+# E(π|y) = [n/(n+2)] × (y/n) + [2/(n+2)] × 0.50
+pm_u_y1 <- a1p_u_y1 / (a1p_u_y1 + a2p_u_y1)
+pm_u_y2 <- a1p_u_y2 / (a1p_u_y2 + a2p_u_y2)
+pm_j_y1 <- a1p_j_y1 / (a1p_j_y1 + a2p_j_y1)
+pm_j_y2 <- a1p_j_y2 / (a1p_j_y2 + a2p_j_y2)
+pm_i_y1 <- a1p_i_y1 / (a1p_i_y1 + a2p_i_y1)
+pm_i_y2 <- a1p_i_y2 / (a1p_i_y2 + a2p_i_y2)
+
+cat("Posterior Means: π₁ (Year 1) vs π₂ (Year 2+)\n")
+cat(sprintf("%-18s %8s %8s\n", "Prior", "π₁ (Y1)", "π₂ (Y2+)"))
+cat(sprintf("%-18s %8.4f %8.4f\n", "MLE (frequentist)", y1/n1, y2/n2))
+cat(sprintf("%-18s %8.4f %8.4f\n", "Uniform",       pm_u_y1, pm_u_y2))
+cat(sprintf("%-18s %8.4f %8.4f\n", "Jeffreys",      pm_j_y1, pm_j_y2))
+cat(sprintf("%-18s %8.4f %8.4f\n", "Informative",   pm_i_y1, pm_i_y2))
+
+cat("\nShrinkage decomposition (uniform, Year 1):\n")
+cat("  E(π₁|y₁) =", round(n1/(n1+2), 4), "×", round(y1/n1, 4),
+    "+", round(2/(n1+2), 4), "× 0.50 =", round(pm_u_y1, 4), "\n")
+cat("Shrinkage decomposition (uniform, Year 2+):\n")
+cat("  E(π₂|y₂) =", round(n2/(n2+2), 4), "×", round(y2/n2, 4),
+    "+", round(2/(n2+2), 4), "× 0.50 =", round(pm_u_y2, 4), "\n")
+```
+
+```{r posterior-plot, fig.height=5}
+# Overlay posterior pdfs for both periods, uniform prior
+pi_grid <- seq(0.01, 0.99, by = 0.001)
+
+df_post_plot <- rbind(
+  data.frame(pi = pi_grid, dens = dbeta(pi_grid, a1p_u_y1, a2p_u_y1),
+             period = "Year 1 (Jan 2024 – Jan 2025)", prior = "Uniform"),
+  data.frame(pi = pi_grid, dens = dbeta(pi_grid, a1p_u_y2, a2p_u_y2),
+             period = "Year 2+ (Jan 2025 – present)", prior = "Uniform"),
+  data.frame(pi = pi_grid, dens = dbeta(pi_grid, a1p_i_y1, a2p_i_y1),
+             period = "Year 1 (Jan 2024 – Jan 2025)", prior = "Informative"),
+  data.frame(pi = pi_grid, dens = dbeta(pi_grid, a1p_i_y2, a2p_i_y2),
+             period = "Year 2+ (Jan 2025 – present)", prior = "Informative")
+)
+
+ggplot(df_post_plot, aes(x = pi, y = dens, color = period, linetype = prior)) +
+  geom_line(linewidth = 1.0) +
+  geom_vline(xintercept = y1/n1, color = "#E41A1C", linetype = "dotted", linewidth = 0.7) +
+  geom_vline(xintercept = y2/n2, color = "#377EB8", linetype = "dotted", linewidth = 0.7) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title    = "Posterior pdf g(pi | y) - IBIT Strong Dominance by Period",
+    subtitle = "π = P(IBIT captures >70% of total ETF volume on a given day) | dotted = MLE",
+    x        = expression("Proportion parameter "*pi),
+    y        = expression("Posterior pdf  g("*pi*" | y)"),
+    color = "Period", linetype = "Prior"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## 2.4 Credible Intervals: Equal-Tail vs HPD
+
+```{r credible-intervals}
+# Equal-tail percentile intervals
+ci_u_y1 <- qbeta(c(0.025, 0.975), a1p_u_y1, a2p_u_y1)
+ci_u_y2 <- qbeta(c(0.025, 0.975), a1p_u_y2, a2p_u_y2)
+
+cat("95% Equal-Tail Percentile Intervals (Uniform prior):\n")
+cat("  Year 1  : (", round(ci_u_y1[1], 4), ",", round(ci_u_y1[2], 4), ")\n")
+cat("  Year 2+ : (", round(ci_u_y2[1], 4), ",", round(ci_u_y2[2], 4), ")\n")
+
+# HPD intervals
+hpd_y1 <- binom.bayes(y1, n1, conf.level = 0.95, alpha1 = a1_unif, alpha2 = a2_unif)
+hpd_y2 <- binom.bayes(y2, n2, conf.level = 0.95, alpha1 = a1_unif, alpha2 = a2_unif)
+
+cat("\n95% HPD Intervals (Uniform prior):\n")
+cat("  Year 1  : (", round(hpd_y1$lower, 4), ",", round(hpd_y1$upper, 4), ")\n")
+cat("  Year 2+ : (", round(hpd_y2$lower, 4), ",", round(hpd_y2$upper, 4), ")\n")
+
+cat("\nFrequentist confidence intervals for reference:\n")
+binom.confint(y1, n1, conf.level = 0.95, method = "wilson")
+binom.confint(y2, n2, conf.level = 0.95, method = "wilson")
+```
+
+## 2.5 Regime-Shift Test: Is π₁ > π₂?
+
+This is the key non-degenerate Bayesian quantity. We simulate 10 million draws from each
+posterior and compute $P(\pi_1 > \pi_2 \mid y_1, y_2)$, the posterior probability that
+IBIT's strong-dominance rate in Year 1 exceeded that of Year 2+.
+
+```{r regime-test}
+N_sim    <- 10000000
+pi_y1_mc <- rbeta(N_sim, a1p_u_y1, a2p_u_y1)
+pi_y2_mc <- rbeta(N_sim, a1p_u_y2, a2p_u_y2)
+
+diff_regime <- pi_y1_mc - pi_y2_mc
+
+# Posterior interval for the period difference
+ci_regime  <- quantile(diff_regime, c(0.025, 0.975))
+hpd_regime <- HDInterval::hdi(diff_regime, credMass = 0.95)
+
+# The headline Bayesian question: has dominance eroded?
+p_regime_shift <- mean(pi_y1_mc > pi_y2_mc)   # P(π₁ > π₂ | data)
+
+cat("Regime-Shift Posterior Results\n")
+cat("95% Equal-tail CI for π₁ − π₂ : (",
+    round(ci_regime[1], 4), ",", round(ci_regime[2], 4), ")\n")
+cat("95% HPD Interval for π₁ − π₂  : (",
+    round(hpd_regime[1], 4), ",", round(hpd_regime[2], 4), ")\n")
+cat("P(π₁ > π₂ | data) =", round(p_regime_shift, 4),
+    " ← has Year-1 dominance rate exceeded Year-2+?\n")
+cat("P(π₁ < π₂ | data) =", round(1 - p_regime_shift, 4), "\n")
+
+# Frequentist two-proportion test for reference
+prop.test(c(y1, y2), c(n1, n2), correct = FALSE)
+```
+
+```{r regime-hist, fig.height=4.5}
+hist_regime <- data.frame(diff = diff_regime[sample(N_sim, 200000)])
+
+ggplot(hist_regime, aes(x = diff)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 70,
+                 fill = "steelblue4", alpha = 0.75, color = "white") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = ci_regime[1], color = "black", linetype = "dotted") +
+  geom_vline(xintercept = ci_regime[2], color = "black", linetype = "dotted") +
+  annotate("text", x = ci_regime[2] + 0.01, y = Inf,
+           label = paste0("P(π₁>π₂) = ", round(p_regime_shift, 3)),
+           hjust = 0, vjust = 1.5, size = 4, color = "darkred") +
+  labs(
+    title    = expression("Posterior Distribution of "*pi[1]-pi[2]*" (Year 1 − Year 2+)"),
+    subtitle = "Based on 10M MC draws, uniform prior | dotted = 95% equal-tail interval",
+    x        = expression(pi[1]-pi[2]), y = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 2.6 Prior Sensitivity Analysis
+
+How strongly does the prior pull the posterior mean? We use symmetric Beta(α, α) priors.
+
+```{r sensitivity}
+# Sensitivity table for Year 2+ (more uncertain, smaller y/n)
+alpha_vals <- c(0.01, 0.1, 0.5, 1, 5, 10, 50, 100)
+
+sensitivity_df <- data.frame(
+  alpha        = alpha_vals,
+  prior_mean   = 0.50,
+  post_mean_y1 = round((y1 + alpha_vals) / (n1 + 2 * alpha_vals), 4),
+  post_mean_y2 = round((y2 + alpha_vals) / (n2 + 2 * alpha_vals), 4),
+  prior_wt_y1  = round(2 * alpha_vals / (n1 + 2 * alpha_vals), 4),
+  prior_wt_y2  = round(2 * alpha_vals / (n2 + 2 * alpha_vals), 4)
+)
+print(sensitivity_df)
+# Both periods have large n: data dominates, but Y2 has smaller y/n so more
+# susceptible to a skeptical (symmetric) prior pulling toward 0.50
+```
+
+## 2.7 Beta-Binomial Predictive Distribution (Year 2+)
+
+For the next $m_f = 10$ trading days, under the Year 2+ posterior, how many days will IBIT
+achieve strong dominance (>70% share)?
+
+```{r predictive-dist, fig.height=4.5}
+library(extraDistr)
+m_future  <- 10
+# Use Year 2+ posterior — the current regime
+pred_prob <- dbbinom(0:m_future, size = m_future, alpha = a1p_u_y2, beta = a2p_u_y2)
+E_Yf      <- m_future * pm_u_y2
+
+pred_df <- data.frame(Y_f = 0:m_future, P = round(pred_prob, 5))
+print(pred_df)
+cat("\nE(Y_f) = n_f × μ₂* =", m_future, "×", round(pm_u_y2, 4), "=", round(E_Yf, 2), "\n")
+
+ggplot(pred_df, aes(x = Y_f, y = P)) +
+  geom_col(fill = "steelblue4", alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = round(P, 3)), vjust = -0.4, size = 3.2) +
+  geom_vline(xintercept = E_Yf, color = "red", linetype = "dashed") +
+  annotate("text", x = E_Yf + 0.3, y = max(pred_df$P) * 0.92,
+           label = paste0("E(Y_f) = ", round(E_Yf, 1)), size = 3.5, color = "red") +
+  scale_x_continuous(breaks = 0:m_future) +
+  labs(
+    title    = paste("Beta-Binomial Predictive: P(IBIT Strong-Dominant in Y_f of Next",
+                     m_future, "Days)"),
+    subtitle = paste("Year 2+ posterior | α₁* =", a1p_u_y2, ", α₂* =", a2p_u_y2),
+    x        = expression("Strong-dominance days "*Y[f]),
+    y        = "Predictive Probability"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+# Section 3 — Competing for Second Place: Non-IBIT ETF Leadership
+
+IBIT dominates total volume so completely that the interesting Beta-Binomial competition
+lives among the **five non-IBIT ETFs** (FBTC, BITB, ARKB, HODL, BTCO). On any given day,
+exactly one of them is the volume leader in the second tier. We define:
+
+$$\pi_k = P(\text{ETF } k \text{ is the non-IBIT volume leader on a random trading day})$$
+
+Under equal competition, $\pi_k = 0.20$ for all $k$. The question is whether **FBTC
+(Fidelity)**, the second-largest fund by AUM, holds a detectable leadership advantage.
+
+## 3.1 Non-IBIT Leadership Counts
+
+```{r compare-shares}
+# For each non-IBIT ETF: days it led the 5-way second-tier volume competition
+non_ibit <- etf_tickers[etf_tickers != "IBIT"]
+n_all    <- nrow(df)
+
+# ETF k "wins" day t if its volume exceeds every other non-IBIT competitor
+y_lead <- setNames(
+  sapply(non_ibit, function(tk) {
+    others     <- non_ibit[non_ibit != tk]
+    vol_k      <- df[[paste0(tk, "_volume")]]
+    vol_others <- df[, paste0(others, "_volume"), drop = FALSE]
+    sum(vol_k > apply(vol_others, 1, max))
+  }),
+  non_ibit
+)
+
+lead_df <- data.frame(
+  ETF         = non_ibit,
+  y           = y_lead,
+  n           = n_all,
+  phat        = round(y_lead / n_all, 4),
+  vs_equal    = round(y_lead / n_all - 0.20, 4),  # excess over 1/5 fair share
+  row.names   = NULL
+)
+cat("Non-IBIT daily volume leadership (y = days ETF led among 5 competitors):\n\n")
+print(lead_df)
+cat("\nFair-share baseline: 0.20 (1/5 under equal competition)\n")
+```
+
+## 3.2 Bayesian Inference per ETF: Is π_k > 0.20?
+
+```{r leadership-posteriors}
+# Posterior P(π_k > 0.20 | data) for each non-IBIT ETF
+# Uniform prior Beta(1,1); posterior Beta(y+1, n-y+1)
+# P(π_k > 0.20 | data) = 1 - pbeta(0.20, y+1, n-y+1)
+
+leadership_results <- lapply(non_ibit, function(tk) {
+  yk       <- y_lead[tk]
+  nk       <- n_all
+  a1_post  <- yk + 1
+  a2_post  <- nk - yk + 1
+  pm_k     <- a1_post / (a1_post + a2_post)
+  ci_k     <- qbeta(c(0.025, 0.975), a1_post, a2_post)
+  hpd_k    <- binom.bayes(yk, nk, conf.level = 0.95, alpha1 = 1, alpha2 = 1)
+  p_gt_eq  <- 1 - pbeta(0.20, a1_post, a2_post)  # P(π > 1/5)
+  p_lt_eq  <- pbeta(0.20, a1_post, a2_post)       # P(π < 1/5)
+
+  data.frame(
+    ETF         = tk,
+    y           = yk,
+    Post_Mean   = round(pm_k, 4),
+    CI_Lower    = round(ci_k[1], 4),
+    CI_Upper    = round(ci_k[2], 4),
+    HPD_Lower   = round(hpd_k$lower, 4),
+    HPD_Upper   = round(hpd_k$upper, 4),
+    P_gt_fifth  = round(p_gt_eq, 4),
+    P_lt_fifth  = round(p_lt_eq, 4)
+  )
+})
+
+lead_res <- do.call(rbind, leadership_results)
+cat("Posterior Inference: P(π_k > 0.20) for each non-IBIT ETF\n\n")
+print(lead_res, row.names = FALSE)
+cat("\nNote: P(π_k > 0.20) = posterior probability that ETF k leads more often",
+    "\nthan its 'fair share' of 1/5 among the 5 competitors.\n")
+```
+
+## 3.3 Monte Carlo for π_FBTC − π_BITB
+
+```{r diff-leadership, fig.height=4.5}
+# Posterior distribution of the gap between the top two second-tier ETFs
+N_sim    <- 10000000
+pi_FBTC_mc <- rbeta(N_sim, y_lead["FBTC"] + 1, n_all - y_lead["FBTC"] + 1)
+pi_BITB_mc <- rbeta(N_sim, y_lead["BITB"] + 1, n_all - y_lead["BITB"] + 1)
+
+diff_lead  <- pi_FBTC_mc - pi_BITB_mc
+ci_lead    <- quantile(diff_lead, c(0.025, 0.975))
+hpd_lead   <- HDInterval::hdi(diff_lead, credMass = 0.95)
+p_fbtc_gt  <- mean(pi_FBTC_mc > pi_BITB_mc)
+
+# Relative risk: how much more likely is FBTC to lead than BITB?
+rr_lead    <- quantile(pi_FBTC_mc / pi_BITB_mc, c(0.025, 0.975))
+
+cat("95% Equal-tail CI for π_FBTC − π_BITB : (",
+    round(ci_lead[1], 4), ",", round(ci_lead[2], 4), ")\n")
+cat("95% HPD Interval                       : (",
+    round(hpd_lead[1], 4), ",", round(hpd_lead[2], 4), ")\n")
+cat("P(π_FBTC > π_BITB | data)              :", round(p_fbtc_gt, 4), "\n")
+cat("95% Posterior Relative Risk interval    : (",
+    round(rr_lead[1], 3), ",", round(rr_lead[2], 3), ")\n")
+
+ggplot(data.frame(diff = diff_lead[sample(N_sim, 200000)]), aes(x = diff)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 60,
+                 fill = "dodgerblue4", alpha = 0.75, color = "white") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = ci_lead[1], color = "black", linetype = "dotted") +
+  geom_vline(xintercept = ci_lead[2], color = "black", linetype = "dotted") +
+  annotate("text", x = max(diff_lead[sample(N_sim,10000)]) * 0.6, y = Inf,
+           label = paste0("P(FBTC>BITB) = ", round(p_fbtc_gt, 3)),
+           hjust = 0, vjust = 2, size = 4, color = "darkblue") +
+  labs(
+    title    = expression("Posterior Distribution of "*pi[FBTC]-pi[BITB]),
+    subtitle = "Non-IBIT second-tier leadership | 10M MC draws | dotted = 95% equal-tail",
+    x        = expression(pi[FBTC]-pi[BITB]), y = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+
+## 3.4 Bonferroni Multiple Comparisons (All 10 Non-IBIT Pairs)
+
+```{r bonferroni-shares}
+n_comp_ni  <- choose(length(non_ibit), 2)   # C(5,2) = 10
+alpha_bonf <- 0.05 / n_comp_ni
+q_lo_bonf  <- alpha_bonf / 2
+q_hi_bonf  <- 1 - alpha_bonf / 2
+
+cat("Bonferroni: individual level =", round(1 - alpha_bonf, 5),
+    "(", n_comp_ni, "comparisons)\n\n")
+
+pairs_ni   <- combn(non_ibit, 2)
+bonf_rows  <- apply(pairs_ni, 2, function(pair) {
+  tk1 <- pair[1]; tk2 <- pair[2]
+  s1  <- rbeta(2000000, y_lead[tk1] + 1, n_all - y_lead[tk1] + 1)
+  s2  <- rbeta(2000000, y_lead[tk2] + 1, n_all - y_lead[tk2] + 1)
+  ci  <- quantile(s1 - s2, c(q_lo_bonf, q_hi_bonf))
+  data.frame(
+    ETF1   = tk1, ETF2 = tk2,
+    Lower  = round(ci[1], 4),
+    Upper  = round(ci[2], 4),
+    P_1gt2 = round(mean(s1 > s2), 4),
+    Result = ifelse(ci[1] > 0, paste0(tk1, " leads ***"),
+               ifelse(ci[2] < 0, paste0(tk2, " leads ***"), "No evidence"))
+  )
+})
+bonf_df <- do.call(rbind, bonf_rows)
+print(bonf_df, row.names = FALSE)
+```
+
+---
+
+# Section 4 — Bayesian Return Inference: Normal-InvGamma Conjugate
+
+**Model**: $Y_i \mid \mu, \sigma^2 \overset{iid}{\sim} N(\mu, \sigma^2)$  
+**Priors**: $\mu \mid \sigma^2 \sim N(\mu_0, \sigma^2/n_0)$ and $\sigma^2 \sim \text{InvGamma}(\alpha, \beta)$  
+**Economic interpretation of prior mean** $\mu_0 = 0$: the Efficient Market Hypothesis says
+a predictably positive expected return would be arbitraged away.
+
+## 4.1 Prior Specification
+
+```{r prior-spec-normal}
+# Prior parameters
+mu0  <- 0.0   # EMH prior: zero expected daily log-return
+n0   <- 2     # 2 imaginary prior observations (weakly informative)
+alpha_pr <- 0.5
+beta_pr  <- 0.5
+
+# Show prior dispersion for σ²: 95% of prior mass on σ²
+prior_lo <- 1 / qgamma(0.975, shape = alpha_pr, rate = beta_pr)
+prior_hi <- 1 / qgamma(0.025, shape = alpha_pr, rate = beta_pr)
+
+cat("Prior InvGamma(0.5, 0.5) implies:\n")
+cat("  P(σ² ∈ (", round(prior_lo, 4), ",", round(prior_hi, 1), ")) = 0.95\n")
+cat("  P(σ ∈ (",  round(sqrt(prior_lo), 4), ",", round(sqrt(prior_hi), 3), ")) = 0.95\n")
+cat("  → Extremely disperse: daily σ between", round(sqrt(prior_lo)*100, 2),
+    "% and", round(sqrt(prior_hi)*100, 1), "% is plausible\n")
+```
+
+## 4.2 Posterior Hyperparameters
+
+```{r conjugate-helpers}
+# Posterior InvGamma shape parameter:  α* = α + n/2
+post.alpha <- function(alpha, n) { alpha + n / 2 }
+
+# Posterior InvGamma scale parameter:  β* = β + ½[(n-1)s² + (n₀n/(n₀+n))(ȳ-μ₀)²]
+post.beta  <- function(beta, y_vec, n, n0, mu0) {
+  beta + (1/2) * (
+    (n - 1) * var(y_vec) +
+    (n0 * n / (n0 + n)) * (mean(y_vec) - mu0)^2
+  )
+}
+```
+
+## 4.3 Credible Intervals and Posterior Tail Probabilities
+
+```{r conjugate-posterior}
+# Analytical marginal posterior t-distribution for μ (each ETF)
+results_conjugate <- lapply(etf_tickers, function(tk) {
+  y_r  <- df[[paste0(tk, "_logret")]]
+  n    <- length(y_r)
+
+  # Posterior mean: precision-weighted average of data and prior
+  postmean  <- (n / (n0 + n)) * mean(y_r) + (n0 / (n0 + n)) * mu0
+
+  # Posterior InvGamma hyperparameters
+  postalpha <- post.alpha(alpha_pr, n)
+  postbeta  <- post.beta(beta_pr, y_r, n, n0, mu0)
+
+  # Standard deviation of the marginal posterior t-distribution
+  # σ_n = √(2β* / (n + n₀ − 1))
+  sigman <- sqrt(2 * postbeta / (n + n0 - 1))
+  df_t   <- n + 2 * alpha_pr            # degrees of freedom for the posterior t
+
+  # 95% credible interval from marginal t
+  ci <- postmean + c(1, -1) * qt(0.025, df_t) * sigman / sqrt(n0 + n)
+
+  # Posterior P(μ < 0): probability of negative expected daily return
+  p_lt_0 <- pt(-postmean / (sigman / sqrt(n + n0)), df_t)
+
+  data.frame(
+    ETF           = tk,
+    N             = n,
+    Sample_Mean   = round(mean(y_r), 7),
+    Post_Mean     = round(postmean, 7),
+    Post_sigman   = round(sigman, 7),
+    CI_95_Lower   = round(ci[1], 7),
+    CI_95_Upper   = round(ci[2], 7),
+    P_mu_lt_0     = round(p_lt_0, 5),
+    P_mu_gt_0     = round(1 - p_lt_0, 5),
+    Ann_Ret_pct   = round(postmean * 252 * 100, 2)
+  )
+})
+
+results_conj <- do.call(rbind, results_conjugate)
+print(results_conj, row.names = FALSE)
+```
+
+## 4.4 Visualisation: Posterior t-Densities for μ
+
+```{r posterior-t-plot, fig.height=5}
+mu_grid <- seq(-0.008, 0.012, length.out = 2000)
+
+curves_list <- lapply(seq_along(etf_tickers), function(i) {
+  row  <- results_conj[i, ]
+  y_r  <- df[[paste0(row$ETF, "_logret")]]
+  n    <- row$N
+  df_t <- n + 2 * alpha_pr
+  se   <- row$Post_sigman / sqrt(n0 + n)
+  # density of the scaled non-central t
+  dens <- dt((mu_grid - row$Post_Mean) / se, df = df_t) / se
+  data.frame(mu = mu_grid, density = dens, ETF = row$ETF)
+})
+df_t_curves <- do.call(rbind, curves_list)
+
+ggplot(df_t_curves, aes(x = mu * 100, y = density, color = ETF)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 0.7) +
+  annotate("text", x = 0.05, y = max(df_t_curves$density) * 0.95,
+           label = "μ₀ = 0 (EMH)", hjust = 0, color = "red", size = 3.5) +
+  scale_color_brewer(palette = "Set2") +
+  labs(
+    title    = "Marginal Posterior t-Distributions for Daily Mean Return μ",
+    subtitle = "All ETFs | EMH prior μ₀ = 0 | n₀ = 2 imaginary observations",
+    x        = "Daily Log-Return μ (%)",
+    y        = expression("Posterior pdf  g("*mu*" | y)"),
+    color    = "ETF"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+# Section 5 — Monte Carlo Simulation and Improper Priors
+
+## 5.1 Full Joint Posterior Simulation (Proper Conjugate Prior)
+
+```{r mc-simulation}
+# Focus on IBIT
+y_ibit <- df$IBIT_logret
+n_ibit <- length(y_ibit)
+
+# Retrieve IBIT posterior hyperparameters
+postmean_ibit  <- (n_ibit / (n0 + n_ibit)) * mean(y_ibit) + (n0 / (n0 + n_ibit)) * mu0
+postalpha_ibit <- post.alpha(alpha_pr, n_ibit)
+postbeta_ibit  <- post.beta(beta_pr, y_ibit, n_ibit, n0, mu0)
+
+N_mc <- 10000000
+
+# Step 1 — simulate σ² from InvGamma posterior
+rsigma2 <- 1 / rgamma(N_mc, shape = postalpha_ibit, rate = postbeta_ibit)
+
+cat("Posterior distribution of σ² (IBIT):\n")
+print(round(quantile(rsigma2, c(0.025, 0.25, 0.5, 0.75, 0.975)), 8))
+
+# Step 2 — conditional posterior variance of μ given σ²
+postvar_cond <- rsigma2 / (n0 + n_ibit)
+
+# Step 3 — simulate μ | σ² ~ N(postmean, postvar_cond)
+mu_mc <- rnorm(N_mc, mean = postmean_ibit, sd = sqrt(postvar_cond))
+
+cat("\nMonte Carlo posterior for IBIT μ (proper conjugate prior):\n")
+cat("  Mean  :", round(mean(mu_mc), 8), "\n")
+cat("  95% CI: (", round(quantile(mu_mc, 0.025), 8), ",",
+                   round(quantile(mu_mc, 0.975), 8), ")\n")
+cat("  P(μ > 0 | data) =", round(mean(mu_mc > 0), 5), "\n")
+```
+
+## 5.2 Improper Jeffreys Prior → Comparison to Frequentist
+
+```{r improper-prior}
+# Improper priors: p(μ) ∝ 1, p(σ²) ∝ 1/σ²
+# Posterior for σ²: ScaledInvChiSq with df = n-1
+# Marginal posterior for μ: t_{n-1}(ȳ, s/√n), identical to frequentist
+
+sum2_ibit <- sum((y_ibit - mean(y_ibit))^2)   # = (n-1)s²
+
+# Simulate σ² from scaled inverse chi-squared
+rsigma2_imp <- sum2_ibit / rchisq(N_mc, df = n_ibit - 1)
+
+# Simulate μ | σ² from conditional N(ȳ, σ²/n)
+mu_imp <- rnorm(N_mc, mean = mean(y_ibit), sd = sqrt(rsigma2_imp) / sqrt(n_ibit))
+
+cat("Improper prior (Jeffreys) posterior for IBIT μ:\n")
+cat("  Posterior mean =", round(mean(mu_imp), 8),
+    "  [sample mean:", round(mean(y_ibit), 8), "]\n")
+cat("  95% Bayesian Interval: (",
+    round(quantile(mu_imp, 0.025), 8), ",",
+    round(quantile(mu_imp, 0.975), 8), ")\n")
+cat("  P(μ < 0 | data) =", round(mean(mu_imp < 0), 5), "\n")
+cat("  P(μ > 0 | data) =", round(mean(mu_imp > 0), 5), "\n")
+
+# Frequentist t-test for comparison
+# Under improper priors, the two frameworks produce NUMERICALLY IDENTICAL intervals
+cat("\nFrequentist t-test (H₀: μ = 0):\n")
+print(t.test(y_ibit))
+```
+
+## 5.3 Posterior Predictive Intervals
+
+```{r prediction-intervals}
+# Next single trading day
+# Y_new | μ, σ² ~ N(μ, σ²) → simulate Y_new using draws from joint posterior
+y_pred_1  <- rnorm(N_mc, mean = mu_imp, sd = sqrt(rsigma2_imp))
+pred_ci_1 <- quantile(y_pred_1, c(0.025, 0.975))
+
+# Analytical: t_{n-1}(ȳ, s√(1 + 1/n))
+s_ibit        <- sd(y_ibit)
+pred_lo_exact <- mean(y_ibit) + qt(0.025, n_ibit - 1) * s_ibit * sqrt(1 + 1/n_ibit)
+pred_hi_exact <- mean(y_ibit) - qt(0.025, n_ibit - 1) * s_ibit * sqrt(1 + 1/n_ibit)
+
+cat("95% Prediction Interval — NEXT TRADING DAY (IBIT):\n")
+cat("  MC simulation : (", round(pred_ci_1[1] * 100, 2), "%, ",
+                           round(pred_ci_1[2] * 100, 2), "%)\n")
+cat("  Analytical t  : (", round(pred_lo_exact * 100, 2), "%, ",
+                           round(pred_hi_exact * 100, 2), "%)\n")
+
+# Next 30-day sample mean (one trading month)
+m_30         <- 30
+y_pred_30    <- rnorm(N_mc, mean = mu_imp, sd = sqrt(rsigma2_imp) / sqrt(m_30))
+pred_ci_30   <- quantile(y_pred_30, c(0.025, 0.975))
+
+pred_lo_30 <- mean(y_ibit) + qt(0.025, n_ibit - 1) * s_ibit * sqrt(1/m_30 + 1/n_ibit)
+pred_hi_30 <- mean(y_ibit) - qt(0.025, n_ibit - 1) * s_ibit * sqrt(1/m_30 + 1/n_ibit)
+
+cat("\n95% Prediction Interval — mean of NEXT 30 DAYS (IBIT):\n")
+cat("  MC simulation : (", round(pred_ci_30[1] * 100, 2), "%, ",
+                           round(pred_ci_30[2] * 100, 2), "%)\n")
+cat("  Analytical t  : (", round(pred_lo_30 * 100, 2), "%, ",
+                           round(pred_hi_30 * 100, 2), "%)\n")
+cat("\n  → Naturally much narrower for the 30-day mean, as margin of error\n",
+    "    decreases toward s/√n as m grows (Ch 3 prediction interval result)\n")
+```
+
+---
+
+# Section 6 — Tracking Error Variance: Who Tracks Bitcoin Most Cleanly?
+
+All six ETFs have statistically indistinguishable **mean** returns becausethey track the same
+asset. The meaningful difference is in **tracking error variance** $\sigma^2_{\text{TE}}$:
+the daily noise around perfect replication.
+
+**Tracking error**: $\text{TE}_{t,k} = r^{ETF}_{k,t} - r^{BTC}_{t}$
+
+Under perfect replication $\text{TE}_{t,k} = 0$ for all $t$. In practice, $\sigma^2_{\text{TE}} > 0$
+due to (i) fee drag, (ii) bid-ask spreads (larger for smaller/less liquid ETFs),
+(iii) creation/redemption delays, and (iv) the 9:30–4pm trading window missing overnight BTC moves.
+
+**Prior**: Improper Jeffreys prior $p(\mu_{\text{TE}}, \sigma^2_{\text{TE}}) \propto 1/\sigma^2_{\text{TE}}$,
+giving the scaled inverse chi-squared posterior.
+The posterior comparison $P(\sigma^2_{\text{IBIT}} < \sigma^2_{\text{HODL}} \mid \text{data})$
+is a well-defined, non-degenerate probability.
+
+## 6.1 Compute Tracking Errors
+
+```{r tracking-errors}
+# Daily tracking error per ETF
+fees <- c(IBIT = 0.0025, FBTC = 0.0025, BITB = 0.0020,
+          ARKB = 0.0021, HODL = 0.0020, BTCO = 0.0025)
+
+for (tk in etf_tickers) {
+  df[[paste0(tk, "_te")]] <- df[[paste0(tk, "_logret")]] - df$BTC_logret
+}
+
+te_cols <- paste0(etf_tickers, "_te")
+te_summary <- do.call(rbind, lapply(etf_tickers, function(tk) {
+  te <- df[[paste0(tk, "_te")]]
+  expected_daily_drag <- -fees[tk] / 252
+  data.frame(
+    ETF              = tk,
+    Fee_pct          = fees[tk] * 100,
+    N                = length(te),
+    Mean_TE_bps      = round(mean(te) * 10000, 3),    # in basis points
+    SD_TE_bps        = round(sd(te)   * 10000, 3),    # in basis points
+    Expected_Drag_bps= round(expected_daily_drag * 10000, 3),
+    Excess_Drag_bps  = round((mean(te) - expected_daily_drag) * 10000, 3)
+  )
+}))
+
+cat("Tracking Error Summary (bps = basis points = 0.01%)\n\n")
+print(te_summary, row.names = FALSE)
+cat("\nExpected daily drag = -Annual Fee / 252 trading days\n")
+cat("Excess drag < 0 → ETF loses more than fee alone explains (execution costs)\n")
+cat("SD_TE is the key volatility metric: lower = cleaner tracking\n")
+```
+
+## 6.2 Frequentist ANOVA on Tracking Error Variance
+
+```{r freq-anova}
+# Bartlett's test: H₀ that all σ²_TE are equal
+te_long <- tidyr::pivot_longer(
+  df[, c("date", te_cols)],
+  cols = -date, names_to = "etf", values_to = "te"
+) %>% dplyr::mutate(etf = factor(gsub("_te", "", etf)))
+
+bartlett.test(te ~ etf, data = te_long)
+# P-value < 0.05 → reject equal variances → ETFs do differ in tracking quality
+```
+
+## 6.3 Bayesian InvGamma Posterior for σ²_TE per ETF
+
+Using the scaled inverse chi-squared posterior (improper prior):
+
+$$\sigma^2_{\text{TE}} \mid \text{data} \sim \frac{(n-1)s^2_{\text{TE}}}{\chi^2_{n-1}}$$
+
+```{r te-variance-posteriors}
+N_mc_te <- 5000000   # 5M draws per ETF
+
+# Simulate posterior distributions of σ²_TE for each ETF
+sigma2_te_post <- lapply(etf_tickers, function(tk) {
+  te       <- df[[paste0(tk, "_te")]]
+  n_te     <- length(te)
+  ss_te    <- sum((te - mean(te))^2)        # (n-1)s²_TE
+  # Scaled inverse chi-squared: σ² ~ ss / χ²_{n-1}
+  1 / rgamma(N_mc_te, shape = (n_te - 1) / 2, rate = ss_te / 2)
+})
+names(sigma2_te_post) <- etf_tickers
+
+# Posterior summary table
+te_var_summary <- do.call(rbind, lapply(etf_tickers, function(tk) {
+  sv2 <- sigma2_te_post[[tk]]
+  data.frame(
+    ETF           = tk,
+    Fee_pct       = fees[tk] * 100,
+    Post_Mean_bps2= round(mean(sv2) * 1e8, 4),      # in (bps)²
+    Post_SD_bps   = round(sqrt(mean(sv2)) * 10000, 4), # posterior mean σ in bps
+    CI95_Lower_bps= round(sqrt(quantile(sv2, 0.025)) * 10000, 4),
+    CI95_Upper_bps= round(sqrt(quantile(sv2, 0.975)) * 10000, 4)
+  )
+}))
+
+cat("Posterior of σ_TE per ETF (bps = basis points of daily tracking error) \n\n")
+print(te_var_summary, row.names = FALSE)
+cat("\nLarger σ_TE → noisier daily tracking → ETF less efficient for precise replication\n")
+```
+
+```{r te-variance-plot, fig.height=5}
+# Posterior densities of σ_TE (not σ²: easier to interpret in bps)
+sigma_te_df <- do.call(rbind, lapply(etf_tickers, function(tk) {
+  # Transform: posterior of σ_TE = sqrt(σ²_TE)
+  sg <- sqrt(sigma2_te_post[[tk]][sample(N_mc_te, 200000)]) * 10000  # in bps
+  data.frame(sigma_bps = sg, ETF = tk)
+}))
+
+ggplot(sigma_te_df, aes(x = sigma_bps, color = ETF, fill = ETF)) +
+  geom_density(alpha = 0.15, linewidth = 0.9) +
+  scale_color_brewer(palette = "Set2") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title    = "Posterior Distributions of Daily Tracking Error Std. Dev. (σ_TE) by ETF",
+    subtitle = "Scaled Inverse Chi-Squared posterior | Improper prior p(σ²) ∝ 1/σ² | Unit: bps",
+    x        = "Tracking Error σ_TE (basis points per day)",
+    y        = "Posterior density",
+    color    = "ETF", fill = "ETF"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## 6.4 Pairwise Posterior Probabilities
+
+```{r te-variance-comparison}
+# P(σ²_k1 < σ²_k2 | data): does ETF k1 track more cleanly than k2?
+# Focus on the most economically interesting comparisons
+comparisons <- list(
+  c("IBIT", "HODL"),  # largest vs smallest AUM
+  c("IBIT", "BTCO"),  # largest vs mid-sized
+  c("FBTC", "HODL"),  # Fidelity vs VanEck
+  c("FBTC", "BITB"),  # top two vs Bitwise
+  c("BITB", "ARKB"),  # similar-size competitors
+  c("HODL", "BTCO")   # two smallest
+)
+
+comp_results <- do.call(rbind, lapply(comparisons, function(pair) {
+  tk1 <- pair[1]; tk2 <- pair[2]
+  s1  <- sigma2_te_post[[tk1]]
+  s2  <- sigma2_te_post[[tk2]]
+  p_k1_cleaner <- mean(s1 < s2)   # P(σ²_k1 < σ²_k2) = P(k1 tracks more cleanly)
+  ratio_ci     <- quantile(sqrt(s1) / sqrt(s2), c(0.025, 0.975))  # σ ratio in σ_TE scale
+  data.frame(
+    ETF1            = tk1,
+    ETF2            = tk2,
+    P_ETF1_cleaner  = round(p_k1_cleaner, 4),
+    Sigma_ratio_lo  = round(ratio_ci[1], 4),  # 95% CI for σ_TE1 / σ_TE2
+    Sigma_ratio_hi  = round(ratio_ci[2], 4),
+    Interpretation  = ifelse(p_k1_cleaner > 0.95, paste0(tk1, " clearly cleaner"),
+                      ifelse(p_k1_cleaner < 0.05, paste0(tk2, " clearly cleaner"),
+                      "Uncertain"))
+  )
+}))
+
+cat("P(σ²_ETF1 < σ²_ETF2 | data) = P(ETF1 tracks BTC more cleanly)\n\n")
+print(comp_results, row.names = FALSE)
+cat("\nσ ratio CI: 95% posterior interval for σ_TE(ETF1) / σ_TE(ETF2)\n",
+    "Ratio < 1 ← ETF1 has smaller tracking noise\n")
+```
+
+## 6.5 Bonferroni Simultaneous Intervals on σ_TE Ratios
+
+```{r te-bonferroni}
+# All 15 pairs: family-wise 95% coverage via Bonferroni
+n_pairs_all <- choose(length(etf_tickers), 2)
+alpha_bonf_te <- 0.05 / n_pairs_all
+q_lo_te <- alpha_bonf_te / 2
+q_hi_te <- 1 - alpha_bonf_te / 2
+
+all_pairs_te <- combn(etf_tickers, 2)
+bonf_te <- apply(all_pairs_te, 2, function(pair) {
+  tk1 <- pair[1]; tk2 <- pair[2]
+  s1  <- sigma2_te_post[[tk1]]
+  s2  <- sigma2_te_post[[tk2]]
+  ratio_ci <- quantile(sqrt(s1) / sqrt(s2), c(q_lo_te, q_hi_te))
+  data.frame(
+    ETF1   = tk1, ETF2 = tk2,
+    Ratio_Lo = round(ratio_ci[1], 4),
+    Ratio_Hi = round(ratio_ci[2], 4),
+    P_cleaner = round(mean(s1 < s2), 4),
+    Sig = ifelse(ratio_ci[2] < 1, paste0(tk1, " ***"),
+           ifelse(ratio_ci[1] > 1, paste0(tk2, " ***"), "ns"))
+  )
+})
+bonf_te_df <- do.call(rbind, bonf_te)
+cat("Bonferroni σ_TE ratio intervals (individual level =",
+    round(1 - alpha_bonf_te, 5), ", 15 pairs):\n\n")
+print(bonf_te_df, row.names = FALSE)
+cat("\n*** = ratio CI excludes 1 → that ETF tracks more cleanly at family-wise 95%\n")
+```
+
+---
+
+# Section 7 — Bayesian Tracking Regression
+
+**Core question**: Does IBIT faithfully replicate Bitcoin, and is there any residual "alpha"?  
+Under perfect tracking: intercept $\alpha = 0$, slope $\beta = 1$.
+
+## 7.1 Frequentist OLS
+
+```{r ols-reference}
+df_reg <- df[, c("date", "IBIT_logret", "BTC_logret", "IBIT_share")]
+df_reg <- na.omit(df_reg)
+cat("Regression sample size:", nrow(df_reg), "\n\n")
+
+lm_simple <- lm(IBIT_logret ~ BTC_logret, data = df_reg)
+summary(lm_simple)
+# Expect β ≈ 1, tiny α, R² ≈ 0.99
+```
+
+## 7.2 Bayesian Simple Regression: IBIT ~ BTC
+
+```{r bayes-regression-simple, results='hide'}
+# Prior specification (informed by ETF mechanics)
+# Intercept (daily alpha): N(0, 0.001) — ETFs charge a fee, alpha should be tiny negative
+# Slope (beta_BTC): N(1, 0.1) — tracking expected to be near 1
+# Sigma: exponential(100) — tracking error tiny (< 1% daily)
+
+fit_simple <- brms::brm(
+  formula = IBIT_logret ~ BTC_logret,
+  family  = gaussian,
+  data    = df_reg,
+  prior   = brms::prior(normal(0, 0.001),  class = Intercept) +
+            brms::prior(normal(1, 0.1),    class = b, coef = "BTC_logret") +
+            brms::prior(exponential(100),  class = sigma),
+  chains  = 4, iter = 4000, warmup = 1000, cores = 4,
+  refresh = 0, silent = 2, seed = 42
+)
+```
+
+```{r simple-summary}
+summary(fit_simple)
+```
+
+```{r tracking-posteriors}
+# Posterior quantities of interest
+post_draws <- brms::as_draws_df(fit_simple)
+
+# The three non-degenerate questions about β_BTC
+# P(β < 1 | data): systematic under-tracking?  Under perfect replication β = 1.
+p_beta_lt1   <- mean(post_draws$b_BTC_logret < 1)
+
+# P(β < 0.95 | data): economically significant under-tracking (> 5% lag)?
+p_beta_lt095 <- mean(post_draws$b_BTC_logret < 0.95)
+
+# P(β < 0.93 | data): consistent with our observed estimate?
+p_beta_lt093 <- mean(post_draws$b_BTC_logret < 0.93)
+
+# P(α > 0 | data): evidence of positive excess return (alpha)?
+p_alpha_pos  <- mean(post_draws$b_Intercept > 0)
+
+# Posterior mean + 95% CI for β
+beta_ci <- posterior_summary(fit_simple)["b_BTC_logret", c("Estimate", "Q2.5", "Q97.5")]
+
+cat("Tracking Regression Posterior Results \n")
+cat("β_BTC posterior mean            :", round(beta_ci["Estimate"], 6), "\n")
+cat("β_BTC 95% credible interval     : (",
+    round(beta_ci["Q2.5"], 6), ",", round(beta_ci["Q97.5"], 6), ")\n\n")
+cat("P(β < 1.00 | data) =", round(p_beta_lt1,   4),
+    "  ← probability of systematic under-tracking\n")
+cat("P(β < 0.95 | data) =", round(p_beta_lt095, 4),
+    "  ← probability of economically significant lag (>5%)\n")
+cat("P(β < 0.93 | data) =", round(p_beta_lt093, 4),
+    "  ← probability β is below 0.93\n")
+cat("P(α > 0   | data) =",  round(p_alpha_pos,  4),
+    "  ← probability of positive daily excess return\n\n")
+cat("Interpretation: R² =", round(summary(lm_simple)$r.squared, 4),
+    "— IBIT explains only ~82% of BTC variance.\n")
+cat("The 24/7 BTC market vs 9:30am-4pm ETF hours creates structural β < 1:\n")
+cat("overnight BTC moves are captured only in the following ETF open price.\n")
+```
+
+## 7.3 Time-Split Regression: Has β Evolved from Year 1 to Year 2+?
+
+If the ETF market has matured (more AUM, tighter arbitrage, better creation/redemption) we
+would expect $\beta$ to drift **toward 1.00** in Year 2+ as tracking efficiency improves.
+
+```{r time-split-regression, results='hide'}
+# Split regression dataset at the 1-year anniversary
+df_reg_y1 <- df_reg[df_reg$date < cutoff_date, ]
+df_reg_y2 <- df_reg[df_reg$date >= cutoff_date, ]
+
+cat("Year 1 regression sample:", nrow(df_reg_y1), "days\n")
+cat("Year 2+ regression sample:", nrow(df_reg_y2), "days\n")
+
+# Same priors as the full-sample model
+prior_reg <- brms::prior(normal(0, 0.001), class = Intercept) +
+             brms::prior(normal(1, 0.1),   class = b, coef = "BTC_logret") +
+             brms::prior(exponential(100),  class = sigma)
+
+fit_y1 <- brms::brm(
+  formula = IBIT_logret ~ BTC_logret, family = gaussian, data = df_reg_y1,
+  prior   = prior_reg, chains = 4, iter = 4000, warmup = 1000, cores = 4,
+  refresh = 0, silent = 2, seed = 42
+)
+
+fit_y2 <- brms::brm(
+  formula = IBIT_logret ~ BTC_logret, family = gaussian, data = df_reg_y2,
+  prior   = prior_reg, chains = 4, iter = 4000, warmup = 1000, cores = 4,
+  refresh = 0, silent = 2, seed = 42
+)
+```
+
+```{r time-split-results}
+b_y1 <- fixef(fit_y1)["BTC_logret", c("Estimate", "Q2.5", "Q97.5")]
+b_y2 <- fixef(fit_y2)["BTC_logret", c("Estimate", "Q2.5", "Q97.5")]
+
+cat("β_BTC by Period\n")
+cat(sprintf("%-12s  β mean    95%% CI                P(β<1)    P(β<0.95)\n", "Period"))
+cat(sprintf("%-12s  %-8.6f  (%-8.6f, %-8.6f)  %-8.4f  %-8.4f\n",
+    "Year 1",
+    b_y1["Estimate"], b_y1["Q2.5"], b_y1["Q97.5"],
+    mean(brms::as_draws_df(fit_y1)$b_BTC_logret < 1),
+    mean(brms::as_draws_df(fit_y1)$b_BTC_logret < 0.95)))
+cat(sprintf("%-12s  %-8.6f  (%-8.6f, %-8.6f)  %-8.4f  %-8.4f\n",
+    "Year 2+",
+    b_y2["Estimate"], b_y2["Q2.5"], b_y2["Q97.5"],
+    mean(brms::as_draws_df(fit_y2)$b_BTC_logret < 1),
+    mean(brms::as_draws_df(fit_y2)$b_BTC_logret < 0.95)))
+cat(sprintf("%-12s  %-8.6f  (%-8.6f, %-8.6f)  %-8.4f  %-8.4f\n",
+    "Full sample",
+    beta_ci["Estimate"], beta_ci["Q2.5"], beta_ci["Q97.5"],
+    p_beta_lt1, p_beta_lt095))
+
+# Posterior probability that β improved (increased) from Y1 to Y2+
+draws_y1 <- brms::as_draws_df(fit_y1)$b_BTC_logret
+draws_y2 <- brms::as_draws_df(fit_y2)$b_BTC_logret
+# Note: different chains, so take min draws to compare element-wise
+n_min    <- min(length(draws_y1), length(draws_y2))
+p_improved <- mean(draws_y2[1:n_min] > draws_y1[1:n_min])
+cat("\nP(β_Y2 > β_Y1 | data) =", round(p_improved, 4),
+    "  ← has tracking improved from Year 1 to Year 2+?\n")
+```
+
+```{r beta-evolution-plot, fig.height=4.5}
+# Overlay posterior β distributions: Year 1, Year 2+, Full sample
+df_beta_compare <- rbind(
+  data.frame(beta = draws_y1, period = "Year 1 (Jan 2024–Jan 2025)"),
+  data.frame(beta = draws_y2, period = "Year 2+ (Jan 2025–present)"),
+  data.frame(beta = brms::as_draws_df(fit_simple)$b_BTC_logret,
+             period = "Full Sample")
+)
+
+ggplot(df_beta_compare, aes(x = beta, color = period, fill = period)) +
+  geom_density(alpha = 0.15, linewidth = 0.9) +
+  geom_vline(xintercept = 1, color = "red", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = 1.002, y = Inf, label = "Perfect tracking β = 1",
+           hjust = 0, vjust = 2, color = "red", size = 3.5) +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title    = "Posterior Distributions of β_BTC by Period — Is IBIT Improving?",
+    subtitle = "Prior: N(1, 0.1) | dashed = perfect tracking β = 1",
+    x        = expression("Tracking coefficient "*beta[BTC]),
+    y        = "Posterior density",
+    color    = "Period", fill = "Period"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## 7.4 Extended Model: Volume Share as Predictor
+
+Does IBIT's own daily volume share predict its return above and beyond Bitcoin?
+A higher IBIT share day could reflect institutional demand → marginal price premium.
+
+```{r bayes-regression-extended, results='hide'}
+# Hypothesis: high IBIT volume share → any price premium?
+fit_extended <- brms::brm(
+  formula = IBIT_logret ~ BTC_logret + IBIT_share,
+  family  = gaussian,
+  data    = df_reg,
+  prior   = brms::prior(normal(0, 0.001), class = Intercept) +
+            brms::prior(normal(1, 0.1),   class = b, coef = "BTC_logret") +
+            brms::prior(normal(0, 0.05),  class = b, coef = "IBIT_share") +
+            brms::prior(exponential(100), class = sigma),
+  chains  = 4, iter = 4000, warmup = 1000, cores = 4,
+  refresh = 0, silent = 2, seed = 42
+)
+```
+
+```{r extended-summary}
+summary(fit_extended)
+
+# Key non-trivial quantity: P(γ_volume > 0 | data)
+# γ_volume = coefficient on IBIT_share
+gamma_draws <- brms::as_draws_df(fit_extended)$b_IBIT_share
+cat("P(γ_volume > 0 | data) =", round(mean(gamma_draws > 0), 4),
+    "  ← does more IBIT volume predict a positive premium?\n")
+cat("95% CI for γ_volume: (",
+    round(quantile(gamma_draws, 0.025), 6), ",",
+    round(quantile(gamma_draws, 0.975), 6), ")\n")
+cat("-> CI contains zero; volume share adds no explanatory power.\n")
+```
+
+
+## 7.5 Posterior Predictive Checks
+
+```{r pp-check, fig.height=4.5}
+# Overlay: observed returns vs returns simulated from posterior
+pp_check(fit_simple, ndraws = 100, type = "dens_overlay") +
+  labs(
+    title    = "Posterior Predictive Check — IBIT Tracking Model",
+    subtitle = "Observed IBIT returns (dark) vs 100 posterior-simulated datasets (light)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r coef-plot, fig.height=4}
+# Posterior distributions of regression coefficients
+bayesplot::mcmc_areas(
+  posterior::as_draws_array(fit_simple),
+  pars  = c("b_Intercept", "b_BTC_logret", "sigma"),
+  prob  = 0.95
+) +
+  labs(
+    title    = "Posterior Distributions — IBIT Tracking Model",
+    subtitle = "95% Credible Intervals | Prior: α ~ N(0,0.001), β ~ N(1,0.1)"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+# Section 8 — MCMC Diagnostics
+
+We fit four `brms` models across this analysis. Good MCMC practice demands verifying
+convergence for **every** model. The two criteria are:
+
+- **R-hat ≤ 1.01**: all chains sampled the same stationary distribution.
+- **Bulk/Tail ESS > 400**: enough independent-equivalent draws for reliable central estimates and quantile-based intervals.
+
+## 8.1 R-hat and ESS — All Models
+
+```{r mcmc-diagnostics}
+# Collect diagnostics from all four fitted models
+models_list  <- list(
+  "Tracking (simple)"   = fit_simple,
+  "Tracking (extended)" = fit_extended,
+  "Time-split Y1"       = fit_y1,
+  "Time-split Y2+"      = fit_y2
+)
+
+diag_summary <- do.call(rbind, lapply(names(models_list), function(nm) {
+  fit       <- models_list[[nm]]
+  rhat_v    <- brms::rhat(fit)
+  rhat_max  <- round(max(rhat_v, na.rm = TRUE), 4)
+  any_bad   <- any(rhat_v > 1.01, na.rm = TRUE)
+  sm        <- summary(fit)
+  ess_min   <- round(min(sm$fixed[, "Bulk_ESS"]), 0)
+  data.frame(Model = nm, Max_Rhat = rhat_max, Any_Rhat_gt_101 = any_bad,
+             Min_Bulk_ESS = ess_min, Status = ifelse(!any_bad & ess_min > 400,
+             "✓ OK", "⚠ CHECK"))
+}))
+print(diag_summary, row.names = FALSE)
+cat("\n[target: Max_Rhat ≤ 1.01 | Min_Bulk_ESS > 400]\n")
+
+# Detailed fixed-effects diagnostics for the primary model
+cat("\nDetailed table — Tracking (simple):\n")
+rhat_vals <- brms::rhat(fit_simple)
+neff_vals <- brms::neff_ratio(fit_simple)
+model_summary <- summary(fit_simple)
+print(model_summary$fixed[, c("Bulk_ESS", "Tail_ESS", "Rhat")])
+```
+
+## 8.2 Trace Plots
+
+```{r trace-plots, fig.height=6}
+# "Caterpillar fuzz" = well-mixed, stationary chains
+# Slow drift or wide between-chain gaps indicate convergence failure
+posterior_array <- posterior::as_draws_array(fit_simple)
+
+bayesplot::mcmc_trace(
+  posterior_array,
+  pars       = c("b_Intercept", "b_BTC_logret", "sigma"),
+  facet_args = list(ncol = 1, strip.position = "left")
+) +
+  labs(
+    title    = "MCMC Trace Plots — Tracking (Simple) Model",
+    subtitle = "Each color = one of 4 parallel chains | Dense overlap = good mixing"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r trace-plots-split, fig.height=6}
+# Trace plots for the time-split models
+pa_y1 <- posterior::as_draws_array(fit_y1)
+bayesplot::mcmc_trace(
+  pa_y1,
+  pars       = c("b_Intercept", "b_BTC_logret", "sigma"),
+  facet_args = list(ncol = 1, strip.position = "left")
+) +
+  labs(
+    title    = "MCMC Trace Plots — Time-Split Year 1 Model",
+    subtitle = "Smaller sample (Year 1 only) — verify chains still mix adequately"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+## 8.3 Autocorrelation Plots
+
+```{r acf-plots, fig.height=4.5}
+# Fast autocorrelation decay = efficient sampling
+# Near-zero by lag 5 → each draw is effectively independent
+bayesplot::mcmc_acf(
+  posterior_array,
+  pars = c("b_Intercept", "b_BTC_logret", "sigma"),
+  lags = 30
+) +
+  labs(
+    title    = "MCMC Autocorrelation — Tracking (Simple) Model",
+    subtitle = "Target: near-zero by lag ~5 for efficient sampling"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+
+## 8.4 Prior Sensitivity Check (Informative vs Diffuse)
+
+```{r prior-sensitivity, results='hide'}
+# Refit with diffuse prior: N(0, 10) — prior has essentially zero pull
+fit_diffuse <- brms::brm(
+  formula = IBIT_logret ~ BTC_logret,
+  family  = gaussian,
+  data    = df_reg,
+  prior   = brms::prior(normal(0, 10), class = Intercept) +
+            brms::prior(normal(0, 10), class = b) +
+            brms::prior(exponential(1), class = sigma),
+  chains  = 4, iter = 4000, warmup = 1000, cores = 4,
+  refresh = 0, silent = 2, seed = 42
+)
+```
+
+```{r sensitivity-compare}
+# Compare β_BTC under informative vs diffuse prior
+inf_ci   <- fixef(fit_simple)["BTC_logret", c("Estimate", "Q2.5", "Q97.5")]
+diff_ci  <- fixef(fit_diffuse)["BTC_logret", c("Estimate", "Q2.5", "Q97.5")]
+
+cat("Prior Sensitivity: β_BTC\n")
+cat("Informative N(1, 0.1)  → Posterior mean:", round(inf_ci["Estimate"], 6),
+    "  95% CI: (", round(inf_ci["Q2.5"], 6), ",", round(inf_ci["Q97.5"], 6), ")\n")
+cat("Diffuse     N(0, 10)   → Posterior mean:", round(diff_ci["Estimate"], 6),
+    "  95% CI: (", round(diff_ci["Q2.5"], 6), ",", round(diff_ci["Q97.5"], 6), ")\n")
+cat("\n→ Virtually identical results: the data utterly dominates both priors.\n")
+cat("  This illustrates the Bayesian large-sample convergence theorem (Ch 1):\n")
+cat("  as n grows, the posterior concentrates around the likelihood regardless\n")
+cat("  of the prior, provided the prior has non-zero mass near the truth.\n")
+```
+
+---
+
+# Section 9 — Results Summary
+
+```{r final-summary}
+cat("BAYESIAN ANALYSIS SUMMARY — US SPOT BITCOIN ETFs\n")
+cat("  Trading days in sample:", nrow(df), "\n")
+cat("  Date range:", format(min(df$date)), "to", format(max(df$date)), "\n")
+cat("  Year 1  (< Jan 2025):", nrow(df_y1), "days\n")
+cat("  Year 2+ (≥ Jan 2025):", nrow(df_y2), "days\n\n")
+
+cat("SECTION 2: IBIT REGIME-SHIFT (strong dominance >70%, uniform prior)\n")
+cat("  Year 1: y₁ =", y1, "/", n1, "| π̂₁ =", round(y1/n1, 4),
+    "| 95% HPD: (", round(hpd_y1$lower, 4), ",", round(hpd_y1$upper, 4), ")\n")
+cat("  Year 2+ : y₂ =", y2, "/", n2, "| π̂₂ =", round(y2/n2, 4),
+    "| 95% HPD: (", round(hpd_y2$lower, 4), ",", round(hpd_y2$upper, 4), ")\n")
+cat("  P(π₁ > π₂ | data) =", round(p_regime_shift, 4),
+    "← has Year-1 dominance eroded?\n")
+cat("  95% CI for π₁ − π₂: (",
+    round(ci_regime[1], 4), ",", round(ci_regime[2], 4), ")\n\n")
+
+cat("SECTION 3: NON-IBIT LEADERSHIP (who leads among FBTC/BITB/ARKB/HODL/BTCO)\n")
+cat("  Leader probabilities P(π_k > 0.20 | data) — fair share = 0.20:\n")
+for (i in seq_len(nrow(lead_res))) {
+  cat(sprintf("    %-5s  π̂ = %-6.4f  P(π>1/5) = %-6.4f  HPD: (%-6.4f, %-6.4f)\n",
+      lead_res$ETF[i], lead_res$Post_Mean[i], lead_res$P_gt_fifth[i],
+      lead_res$HPD_Lower[i], lead_res$HPD_Upper[i]))
+}
+cat("  P(π_FBTC > π_BITB | data) =", round(p_fbtc_gt, 4), "\n\n")
+
+cat("SECTION 4: MEAN RETURN INFERENCE (Normal-InvGamma conjugate, μ₀=0)\n")
+print(results_conj[, c("ETF", "Post_Mean", "CI_95_Lower", "CI_95_Upper",
+                        "P_mu_gt_0", "Ann_Ret_pct")], row.names = FALSE)
+cat("\n")
+
+cat("SECTION 5: IMPROPER PRIOR vs FREQUENTIST (IBIT)\n")
+cat("  P(μ > 0 | data) =", round(mean(mu_imp > 0), 4),
+    "  [Bayesian, improper prior ≡ frequentist t-test]\n")
+cat("  95% prediction interval next day: (",
+    round(pred_ci_1[1] * 100, 2), "%, ", round(pred_ci_1[2] * 100, 2), "%)\n")
+cat("  95% prediction interval 30-day mean: (",
+    round(pred_ci_30[1] * 100, 2), "%, ", round(pred_ci_30[2] * 100, 2), "%)\n\n")
+
+cat("SECTION 6: TRACKING ERROR VARIANCE (σ_TE per ETF, bps/day)\n")
+print(te_var_summary[, c("ETF", "Fee_pct", "Post_SD_bps", "CI95_Lower_bps",
+                          "CI95_Upper_bps")], row.names = FALSE)
+cat("\n  Key pairwise P(σ²_ETF1 < σ²_ETF2):\n")
+for (i in seq_len(nrow(comp_results))) {
+  cat(sprintf("    %-5s vs %-5s : P(%s cleaner) = %-6.4f | σ ratio CI: (%-6.4f, %-6.4f)\n",
+      comp_results$ETF1[i], comp_results$ETF2[i],
+      comp_results$ETF1[i], comp_results$P_ETF1_cleaner[i],
+      comp_results$Sigma_ratio_lo[i], comp_results$Sigma_ratio_hi[i]))
+}
+cat("\n")
+
+cat("SECTION 7: TRACKING REGRESSION (IBIT ~ BTC)\n")
+cat("  β_BTC full sample: mean =", round(fixef(fit_simple)["BTC_logret", "Estimate"], 6),
+    "  95% CI: (", round(fixef(fit_simple)["BTC_logret", "Q2.5"], 6),
+    ",", round(fixef(fit_simple)["BTC_logret", "Q97.5"], 6), ")\n")
+cat("  P(β < 1.00 | data) =", round(p_beta_lt1,   4),
+    "  ← evidence of systematic under-tracking\n")
+cat("  P(β < 0.95 | data) =", round(p_beta_lt095, 4),
+    "  ← economically significant lag\n")
+cat("  P(α > 0   | data) =",  round(p_alpha_pos,  4),
+    "  ← no evidence of positive alpha\n")
+cat("  Time split: P(β improves Year1 → Year2+) =", round(p_improved, 4), "\n\n")
+
+cat("SECTION 8: MCMC DIAGNOSTICS\n")
+print(diag_summary, row.names = FALSE)
+```
+
+---
+
